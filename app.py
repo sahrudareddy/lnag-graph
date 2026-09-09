@@ -1,8 +1,9 @@
+import os
+import sys
+import io
+import traceback
 from typing import TypedDict, List, Optional
 from dotenv import load_dotenv
-
-from fastapi import FastAPI
-from pydantic import BaseModel
 
 from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.tools import tool
@@ -11,7 +12,6 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 import google.generativeai as genai
 
 # Load environment variables (useful for local testing with a .env file)
-# Load environment variables
 load_dotenv()
 
 # ==========================================
@@ -25,25 +25,58 @@ if not api_key:
 
 genai.configure(api_key=api_key)
 print("API Key configured successfully.")
-if api_key:
-    genai.configure(api_key=api_key)
 
 # Initialize the LLM
 llm = ChatGoogleGenerativeAI(
     model="gemini-3.1-flash-lite-preview", # Note: Ensure this model version is currently active on your GCP/AI Studio account
-    model="gemini-3.1-flash-lite-preview", 
-google_api_key=api_key
+    google_api_key=api_key
 )
 
-@@ -37,7 +35,6 @@
+# ==========================================
+# 2. STATE DEFINITION
 # ==========================================
 class CrewState(TypedDict):
-messages: List[BaseMessage]
+    messages: List[BaseMessage]
     next_step: Optional[str]
-code: Optional[str]
-report: Optional[str]
+    code: Optional[str]
+    report: Optional[str]
 
-@@ -80,38 +77,21 @@ def generate_test_cases(task_description: str) -> str:
+# ==========================================
+# 3. TOOLS
+# ==========================================
+@tool
+def run_python_code(code: str) -> str:
+    """Execute python code and return the standard output or error trace."""
+    if not isinstance(code, str):
+        code = str(code)
+    clean_code = code.replace('```python', '').replace('```', '').strip()
+
+    old_stdout = sys.stdout
+    new_stdout = io.StringIO()
+    sys.stdout = new_stdout
+
+    try:
+        local_scope = {}
+        exec(clean_code, {}, local_scope)
+        result = new_stdout.getvalue()
+    except Exception as e:
+        result = f"Execution Error:\n{traceback.format_exc()}"
+    finally:
+        sys.stdout = old_stdout
+
+    return result.strip() if result.strip() else "Success (no terminal output)"
+
+@tool
+def generate_test_cases(task_description: str) -> str:
+    """Generate specific test scenarios for a given coding task."""
+    prompt = (
+        f"You are a Senior QA Engineer. Generate 3 to 5 highly specific test scenarios "
+        f"for the following coding task: '{task_description}'.\n"
+        f"Include standard cases and edge cases. Return them as a numbered list."
+    )
+    response = llm.invoke(prompt)
+    return response.content if hasattr(response, 'content') else str(response)
+
 # ==========================================
 # 4. GRAPH NODES
 # ==========================================
@@ -62,29 +95,39 @@ def task_input_node(state: CrewState):
 
 def real_time_developer(state: CrewState):
     print("\n[Developer] Writing dynamic code using LLM...")
-task = state['messages'][-1].content
-dev_prompt = f"Write a clean Python script to solve this: {task}. Only return the code, no explanation or markdown formatting."
+    task = state['messages'][-1].content
+    dev_prompt = f"Write a clean Python script to solve this: {task}. Only return the code, no explanation or markdown formatting."
 
-response = llm.invoke(dev_prompt)
-
+    response = llm.invoke(dev_prompt)
+    
     # Safely parse Gemini's content format
-content = response.content
-if isinstance(content, list):
-code_str = content[0].get('text', '') if isinstance(content[0], dict) else str(content[0])
-else:
-code_str = str(content)
-
+    content = response.content
+    if isinstance(content, list):
+        code_str = content[0].get('text', '') if isinstance(content[0], dict) else str(content[0])
+    else:
+        code_str = str(content)
+        
     print(code_str)
-return {"code": code_str}
+    return {"code": code_str}
 
 def real_time_tester(state: CrewState):
     print("\n[Tester] Generating dynamic tests and executing code...")
-task = state['messages'][-1].content
+    task = state['messages'][-1].content
 
-# Generate tests
-@@ -129,66 +109,42 @@ def real_time_tester(state: CrewState):
-report = f"### EXECUTION OUTPUT:\n{execution_result}\n\n### TEST SCENARIOS EVALUATED:\n{cases_str}"
-return {"report": report}
+    # Generate tests
+    test_cases = generate_test_cases.invoke(task)
+    content = test_cases
+    if isinstance(content, list):
+        cases_str = content[0].get('text', '') if isinstance(content[0], dict) else str(content[0])
+    else:
+        cases_str = str(content)
+        
+    # Execute code
+    execution_result = run_python_code.invoke({"code": state['code']})
+
+    # Compile Report
+    report = f"### EXECUTION OUTPUT:\n{execution_result}\n\n### TEST SCENARIOS EVALUATED:\n{cases_str}"
+    return {"report": report}
 
 def manager_decision_node(state: CrewState):
     print("\n" + "="*50)
@@ -124,8 +167,6 @@ def route_from_input(state):
 rt_workflow.add_conditional_edges("task_input", route_from_input)
 
 # Sequential flow
-# Sequential flow for the API
-rt_workflow.add_edge(START, "developer")
 rt_workflow.add_edge("developer", "tester")
 rt_workflow.add_edge("tester", "manager_decision")
 
@@ -136,39 +177,18 @@ def route_from_decision(state):
 
 rt_workflow.add_conditional_edges("manager_decision", route_from_decision)
 rt_workflow.add_edge("archiver", END)
-rt_workflow.add_edge("tester", END)
 
 rt_app = rt_workflow.compile()
 print("Interactive pipeline compiled and ready for live execution.")
 
 # ==========================================
 # 6. EXECUTION LOOP
-# 6. FASTAPI WEB SERVER SETUP
 # ==========================================
 if __name__ == "__main__":
-app = FastAPI(title="LangGraph AI Crew")
-
-class TaskRequest(BaseModel):
-    task: str
-
-@app.get("/")
-def home():
-    return {"message": "API is running. Send a POST request to /run with a JSON body containing your 'task'."}
-
-@app.post("/run")
-def run_task(req: TaskRequest):
-try:
+    try:
         # Start the application with an empty state
         rt_app.invoke({"messages": []}, config={"recursion_limit": 50})
     except KeyboardInterrupt:
         print("\nStopped by user.")
-        # Pass the incoming task directly to the LangGraph workflow
-        result = rt_app.invoke({"messages": [HumanMessage(content=req.task)]})
-        return {
-            "status": "success",
-            "generated_code": result.get("code"),
-            "test_report": result.get("report")
-        }
-except Exception as e:
+    except Exception as e:
         print(f"\nAn error occurred: {e}")
-        return {"status": "error", "message": str(e)}
